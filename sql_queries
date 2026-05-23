@@ -1,1 +1,225 @@
+-- Google Merchandise Store - Ecommerce Analysis
+-- Dataset: bigquery-public-data.google_analytics_sample
+--          data-to-insights.ecommerce.all_sessions
+-- Tool: Google BigQuery
+-- ============================================================
 
+
+-- QUERY 1: Top Cities by Revenue
+-- Business Question: Which cities generated the highest revenue?
+-- Concept: Aggregation, GROUP BY, ORDER BY
+-- ============================================================
+-- We use SUM to total up revenue per city.
+-- Revenue in this table is stored in micros (millionths),
+-- so we divide by 1,000,000 to get actual dollar amounts.
+-- We filter out rows where city was not detected by Google Analytics.
+
+SELECT
+  geoNetwork.city      AS city,
+  geoNetwork.country   AS country,
+  SUM(totals.transactionRevenue) / 1000000 AS total_revenue,
+  COUNT(*)             AS sessions
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`
+WHERE geoNetwork.city IS NOT NULL
+  AND geoNetwork.city != '(not set)'
+  AND geoNetwork.city != 'not available in demo dataset'
+GROUP BY geoNetwork.city, geoNetwork.country
+ORDER BY total_revenue DESC
+LIMIT 10;
+
+-- FINDING: San Francisco ($2,964), New York ($1,659), Chicago ($1,158)
+-- are the top 3 revenue cities. All purchases came from the United States.
+
+
+
+
+-- ============================================================
+-- QUERY 2: Traffic Source Analysis
+-- Business Question: Which traffic source brings in the most revenue?
+-- Concept: Aggregation, GROUP BY, filtering NULLs
+-- ============================================================
+-- trafficSource.source tells us where the visitor came from —
+-- google, direct, youtube, email, etc.
+-- We filter to only sessions that had a transaction (revenue is not null).
+
+SELECT
+  trafficSource.source AS traffic_source,
+  SUM(totals.transactionRevenue) / 1000000 AS total_revenue,
+  COUNT(*) AS sessions
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`
+WHERE totals.transactionRevenue IS NOT NULL
+GROUP BY trafficSource.source
+ORDER BY total_revenue DESC
+LIMIT 10;
+
+-- FINDING: Direct traffic ($8,292) is the only meaningful revenue source.
+-- mail.google.com shows 50% conversion but only had 2 sessions — not reliable.
+
+
+
+
+-- ============================================================
+-- QUERY 3: Overall Conversion Rate
+-- Business Question: What % of sessions resulted in a purchase?
+-- Concept: Aggregation, division logic, NULL handling
+-- ============================================================
+-- totals.transactions = 1 when a purchase happened, NULL otherwise.
+-- BigQuery's COUNT() automatically skips NULLs — so COUNT(totals.transactions)
+-- only counts sessions with purchases.
+-- Dividing by COUNT(*) gives us the rate across all sessions.
+
+SELECT
+  COUNT(*)                                          AS total_sessions,
+  COUNT(totals.transactions)                        AS total_purchases,
+  COUNT(totals.transactions) / COUNT(*) * 100       AS conversion_rate
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`;
+
+-- FINDING: 1.68% conversion rate (43 purchases from 2,556 sessions).
+-- This is within the typical ecommerce industry range of 1-3%.
+
+
+
+
+-- ============================================================
+-- QUERY 4: Conversion Rate by Traffic Source
+-- Business Question: Which traffic source has the highest conversion rate?
+-- Concept: GROUP BY, HAVING to filter low-volume sources
+-- ============================================================
+-- HAVING filters AFTER grouping (unlike WHERE which filters before).
+-- We use HAVING COUNT(*) > 50 to remove sources with too few sessions
+-- to be statistically meaningful.
+
+SELECT
+  trafficSource.source                              AS traffic_source,
+  COUNT(*)                                          AS sessions,
+  COUNT(totals.transactions)                        AS purchases,
+  COUNT(totals.transactions) / COUNT(*) * 100       AS conversion_rate
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`
+GROUP BY trafficSource.source
+HAVING COUNT(*) > 50
+ORDER BY conversion_rate DESC;
+
+-- FINDING: Only direct traffic (1.94%) converts meaningfully.
+-- YouTube sent 180 visitors with zero purchases — poor ROI channel.
+-- Partners sent 52 visitors with zero purchases.
+
+
+
+
+-- ============================================================
+-- QUERY 5: City Revenue Ranking Within Each Country
+-- Business Question: Rank cities by revenue within their own country
+-- Concept: Window Functions — RANK(), PARTITION BY
+-- ============================================================
+-- RANK() assigns a rank to each row within a partition.
+-- PARTITION BY country means ranking restarts for each country.
+-- So San Francisco is #1 in USA, London is #1 in UK — separately.
+-- Unlike GROUP BY, window functions keep all rows visible.
+
+SELECT
+  geoNetwork.city                                                AS city,
+  geoNetwork.country                                             AS country,
+  SUM(totals.transactionRevenue) / 1000000                       AS total_revenue,
+  RANK() OVER (
+    PARTITION BY geoNetwork.country
+    ORDER BY SUM(totals.transactionRevenue) DESC
+  )                                                              AS city_rank
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`
+GROUP BY geoNetwork.city, geoNetwork.country
+ORDER BY country, city_rank;
+
+-- FINDING: US cities are fully ranked — San Francisco #1, New York #2, Chicago #3.
+-- Non-US cities show null revenue as purchases were concentrated in the US.
+
+
+
+
+-- ============================================================
+-- QUERY 6: Top 10 Products by Units Sold
+-- Business Question: Which products appear most in sessions?
+-- Concept: GROUP BY on product column, COUNT, ORDER BY
+-- Dataset: data-to-insights.ecommerce.all_sessions
+-- ============================================================
+-- v2ProductName is a flat column in this table (no nesting).
+-- COUNT(*) here counts how many sessions each product appeared in.
+-- Note: this includes views, cart adds, and purchases — not purchases only.
+
+SELECT
+  v2ProductName   AS product_name,
+  COUNT(*)        AS units_sold
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE v2ProductName IS NOT NULL
+GROUP BY v2ProductName
+ORDER BY units_sold DESC
+LIMIT 10;
+
+-- FINDING: Google Men's Cotton T-Shirt (338,436) is the most viewed product.
+-- All top 10 products are Google or YouTube branded apparel.
+-- 8 out of 10 top products are clothing items.
+
+
+
+
+-- ============================================================
+-- QUERY 7: Cart Abandonment Analysis
+-- Business Question: Which visitors added to cart but never purchased?
+-- Concept: CASE WHEN, HAVING with multiple conditions, funnel logic
+-- ============================================================
+-- eCommerceAction_type tracks each step of the checkout funnel:
+--   '2' = product view
+--   '3' = add to cart
+--   '5' = checkout started
+--   '6' = purchase completed
+--
+-- We GROUP BY visitor, then use HAVING to check:
+--   1. At least one action was a cart add (action_type = '3')
+--   2. No action was a purchase (action_type = '6')
+--
+-- MAX(CASE WHEN ... THEN 1 ELSE 0 END) = 1 means "this event happened at least once"
+-- MAX(CASE WHEN ... THEN 1 ELSE 0 END) = 0 means "this event never happened"
+
+SELECT
+  fullVisitorId,
+  COUNT(*) AS total_actions
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY fullVisitorId
+HAVING
+  MAX(CASE WHEN eCommerceAction_type = '3' THEN 1 ELSE 0 END) = 1
+  AND MAX(CASE WHEN eCommerceAction_type = '6' THEN 1 ELSE 0 END) = 0;
+
+-- FINDING: These visitor IDs represent real cart abandoners.
+-- In a production environment, this list would feed a retargeting
+-- email campaign — "You left something in your cart!"
+
+
+
+
+-- ============================================================
+
+-- QUERY 8: Conversion Rate by Traffic Source (CTE Version)
+-- Business Question: Which high-volume sources convert above 1%?
+-- Concept: CTEs (Common Table Expressions)
+-- ============================================================
+-- A CTE is a named temporary query defined with the WITH keyword.
+-- It breaks complex logic into readable steps.
+-- Step 1 (inside CTE): calculate conversion rate per source
+-- Step 2 (outside CTE): filter only meaningful, high-converting sources
+
+WITH conversion_by_source AS (
+  SELECT
+    trafficSource.source  AS traffic_source,
+    COUNT(*)              AS sessions,
+    COUNT(totals.transactions)  AS purchases,
+    COUNT(totals.transactions) / COUNT(*) * 100     AS conversion_rate
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`
+  GROUP BY trafficSource.source
+)
+
+SELECT *
+FROM conversion_by_source
+WHERE conversion_rate > 1
+  AND sessions > 50
+ORDER BY conversion_rate DESC;
+
+-- FINDING: Only direct traffic passes both filters.
+-- This confirms direct traffic is the highest quality acquisition channel.
