@@ -135,7 +135,7 @@ ORDER BY country, city_rank;
 
 
 -- ============================================================
--- QUERY 6: Top 10 Products by Units Sold
+-- QUERY 6: Top 10 Products by Session Appearances
 -- Business Question: Which products appear most in sessions?
 -- Concept: GROUP BY on product column, COUNT, ORDER BY
 -- Dataset: data-to-insights.ecommerce.all_sessions
